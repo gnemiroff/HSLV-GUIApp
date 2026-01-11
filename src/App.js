@@ -3,6 +3,8 @@ import "./styles.css";
 
 const RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
 
+const WEBHOOK_URL = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
+
 function App() {
   const [data, setData] = useState([]);               // [{Query, Rank1, Rank2, Rank3, selectedRankKey?}, ...]
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -11,6 +13,13 @@ function App() {
   const [inputFileName, setInputFileName] = useState(null);
   const [status, setStatus] = useState("");
 
+  // Upload-Projekt Modal
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [kbFiles, setKbFiles] = useState([]);
+  const [lvFiles, setLvFiles] = useState([]);
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState("");
+
   const currentRow = data[currentIndex] || null;
 
   // Wenn der Nutzer links in der Tabelle auf eine andere Zeile springt,
@@ -18,6 +27,16 @@ function App() {
   useEffect(() => {
     setActiveRankTab("Rank1");
   }, [currentIndex]);
+
+  // Modal per ESC schließen
+  useEffect(() => {
+    if (!showUploadModal) return;
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") setShowUploadModal(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showUploadModal]);
 
   // ---------- Hilfsfunktionen: Werte robust aus JSON ziehen ----------
   const toStr = (v) => (v === null || v === undefined ? "" : String(v));
@@ -381,12 +400,12 @@ function App() {
       { label: "Pfad", value: d.path },
       { label: "Kurztext", value: d.kurztext },
       { label: "Langtext", value: d.langtext, type: "textarea" },
-      { label: "Einheit", value: d.einheit },
+      { label: "Quellen", type: "six", values: quellenCols, sixKind: "text" },
       { label: "OZ", type: "six", values: ozCols, sixKind: "text" },
       { label: "Menge(n)", type: "six", values: mengeCols, sixKind: "number" },
       { label: "Einheitspreis", type: "six", values: preisCols, sixKind: "number" },
-      // Quellen soll ganz unten stehen
-      { label: "Quellen", type: "six", values: quellenCols, sixKind: "text" },
+      { label: "Einheit", value: d.einheit },
+
     ]);
   };
 
@@ -404,10 +423,64 @@ function App() {
     };
   };
 
+  const openUploadModal = () => {
+    setKbFiles([]);
+    setLvFiles([]);
+    setUploadMessage("");
+    setShowUploadModal(true);
+  };
+
+  const closeUploadModal = () => {
+    if (uploadBusy) return;
+    setShowUploadModal(false);
+  };
+
+  const uploadProjekt = async () => {
+    if (uploadBusy) return;
+    if (!kbFiles.length || !lvFiles.length) {
+      setUploadMessage("Bitte wähle in beiden Bereichen mindestens eine Datei aus.");
+      return;
+    }
+
+    setUploadBusy(true);
+    setUploadMessage("");
+
+    try {
+      const fd = new FormData();
+      // Reihenfolge ist relevant: erst Wissensbasis, dann LV zu bepreisen.
+      [...kbFiles, ...lvFiles].forEach((f) => fd.append("data", f, f.name));
+
+      const res = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        body: fd,
+      });
+
+      const raw = await res.text();
+      let preview = raw;
+      try {
+        const json = JSON.parse(raw);
+        preview = JSON.stringify(json);
+      } catch (_) {}
+
+      if (!res.ok) {
+        throw new Error(preview || `HTTP ${res.status}`);
+      }
+
+      setStatus(`Upload abgeschlossen (${kbFiles.length + lvFiles.length} Datei(en)).`);
+      setShowUploadModal(false);
+    } catch (e) {
+      console.error(e);
+      setUploadMessage(`Fehler beim Upload: ${e?.message || String(e)}`);
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
   return (
     <div className="app-root">
       <header className="app-header">
         <div>
+          <button onClick={openUploadModal}>Upload Projekt</button>
           <button
             onClick={() => {
               const input = document.getElementById("file-input");
@@ -432,6 +505,87 @@ function App() {
           {status}
         </div>
       </header>
+
+      {showUploadModal && (
+        <div
+          className="modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="upload-modal-title"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeUploadModal();
+          }}
+        >
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="upload-modal-title">Upload Projekt</h3>
+              <button
+                className="modal-close"
+                onClick={closeUploadModal}
+                aria-label="Schließen"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="modal-body">
+              <div className="file-widget">
+                <div className="file-widget-title">Wissensbasis</div>
+                <input
+                  type="file"
+                  multiple
+                  onChange={(e) => setKbFiles(Array.from(e.target.files || []))}
+                />
+                {kbFiles.length > 0 ? (
+                  <ul className="file-list">
+                    {kbFiles.map((f) => (
+                      <li key={f.name + f.size}>{f.name}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+
+              <div className="file-widget">
+                <div className="file-widget-title">LV zu bepreisen</div>
+                <input
+                  type="file"
+                  multiple
+                  onChange={(e) => setLvFiles(Array.from(e.target.files || []))}
+                />
+                {lvFiles.length > 0 ? (
+                  <ul className="file-list">
+                    {lvFiles.map((f) => (
+                      <li key={f.name + f.size}>{f.name}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+
+              <div className="upload-hint">
+                Webhook: <span className="mono">{WEBHOOK_URL}</span>
+              </div>
+
+              {uploadMessage ? (
+                <div className="upload-msg">{uploadMessage}</div>
+              ) : null}
+            </div>
+
+            <div className="modal-footer">
+              <button onClick={closeUploadModal} disabled={uploadBusy}>
+                Abbrechen
+              </button>
+              <button
+                onClick={uploadProjekt}
+                disabled={
+                  uploadBusy || kbFiles.length === 0 || lvFiles.length === 0
+                }
+              >
+                {uploadBusy ? "Upload läuft..." : "Hochladen"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Inline-Fallbacks, damit die 2-Spalten-Aufteilung auch dann hält,
           wenn Styles aus irgendeinem Grund nicht greifen sollten. */}

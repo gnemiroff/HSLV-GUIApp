@@ -1,6 +1,15 @@
+version: "3.8"
+
 services:
-  hs-vergleich-gui:       # Interner Service-Name geändert
+  hs-vergleich-gui:
     build: .
-    container_name: hs-vergleich-gui  # Eindeutiger Container-Name zur Vermeidung von Konflikten
+    container_name: hs-vergleich-gui
     ports:
-      - "8080:80" 
+      - "8080:80"
+
+    # Gemeinsames Host-Verzeichnis, das auch in den n8n-Container gemountet wird.
+    # Darin schreibt n8n die Ergebnisdatei und ein "fertig"-Signal (z.B. als Datei).
+    volumes:
+      - "C:/NEMO/Dev/HS-SemanticSearch/shared:/shared:ro"
+
+    restart: unless-stopped
