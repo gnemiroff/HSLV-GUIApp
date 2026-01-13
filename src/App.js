@@ -3,13 +3,55 @@ import "./styles.css";
 
 const RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
 
-const WEBHOOK_URL = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
+// Drei separate Webhooks
+const WEBHOOK_WISSENSBASIS = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
+const WEBHOOK_LV = "http://localhost:5678/webhook/60b65bb0-3f9d-4f1c-8f4f-aa982e5ea5b7";
+const WEBHOOK_X84 = "http://localhost:5678/webhook/f12d2ee2-9885-4204-91e0-4b6d3fa0c2bf";
+
+
+
+// Hilfsfunktion: Dateiname aus Content-Disposition lesen (für Downloads)
+const parseDownloadFilename = (contentDisposition, fallback = "Anfrage1.X84") => {
+  if (!contentDisposition) return fallback;
+
+  // RFC 5987 / 6266: filename*=UTF-8''...
+  const mStar = contentDisposition.match(/filename\*\s*=\s*([^;]+)/i);
+  if (mStar && mStar[1]) {
+    let v = mStar[1].trim();
+    v = v.replace(/^"(.*)"$/, "$1");
+
+    const parts = v.split("''"); // z.B. UTF-8''Anfrage1.X84
+    if (parts.length === 2) {
+      try {
+        return (decodeURIComponent(parts[1]).split(/[\\/]/).pop() || fallback);
+      } catch {
+        return (parts[1].split(/[\\/]/).pop() || fallback);
+      }
+    }
+
+    try {
+      return (decodeURIComponent(v).split(/[\\/]/).pop() || fallback);
+    } catch {
+      return (v.split(/[\\/]/).pop() || fallback);
+    }
+  }
+
+  // filename="..."
+  const m = contentDisposition.match(/filename\s*=\s*([^;]+)/i);
+  if (m && m[1]) {
+    let v = m[1].trim();
+    v = v.replace(/^"(.*)"$/, "$1");
+    return (v.split(/[\\/]/).pop() || fallback);
+  }
+
+  return fallback;
+};
 
 function App() {
-  const [data, setData] = useState([]);               // [{Query, Rank1, Rank2, Rank3, selectedRankKey?}, ...]
+  const [data, setData] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [activeRankTab, setActiveRankTab] = useState("Rank1");
-  const [selectionMap, setSelectionMap] = useState({}); // index -> "Rank1"|"Rank2"|"Rank3"
+  const [selectionMap, setSelectionMap] = useState({});
   const [inputFileName, setInputFileName] = useState(null);
   const [status, setStatus] = useState("");
 
@@ -22,13 +64,10 @@ function App() {
 
   const currentRow = data[currentIndex] || null;
 
-  // Wenn der Nutzer links in der Tabelle auf eine andere Zeile springt,
-  // soll rechts standardmäßig wieder Rank1 angezeigt werden.
   useEffect(() => {
     setActiveRankTab("Rank1");
   }, [currentIndex]);
 
-  // Modal per ESC schließen
   useEffect(() => {
     if (!showUploadModal) return;
     const onKeyDown = (e) => {
@@ -38,7 +77,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [showUploadModal]);
 
-  // ---------- Hilfsfunktionen: Werte robust aus JSON ziehen ----------
+  // ---------- Hilfsfunktionen ----------
   const toStr = (v) => (v === null || v === undefined ? "" : String(v));
   const isBlank = (v) => toStr(v).trim() === "";
 
@@ -46,13 +85,11 @@ function App() {
     for (const k of keys) {
       if (!obj) continue;
       const v = obj[k];
-      // "0" soll als gültiger Wert durchgehen
       if (v !== undefined && v !== null && !isBlank(v)) return v;
     }
     return "";
   };
 
-  // Semikolon-getrennte Werte als Array (trim + leere Einträge raus)
   const splitSemi = (v) => {
     const s = toStr(v);
     if (isBlank(s)) return [];
@@ -68,9 +105,6 @@ function App() {
     return out;
   };
 
-  // Zahl (de/en) robust auf 2 Nachkommastellen formatieren.
-  // - Akzeptiert z.B. "12", "12,3", "12.3", "1.234,56"
-  // - Wenn es keine "saubere" Zahl ist, wird der Original-String zurückgegeben.
   const formatNumber2 = (v) => {
     const s0 = toStr(v).trim();
     if (s0 === "") return "";
@@ -78,15 +112,12 @@ function App() {
 
     let s = s0.replace(/\s/g, "");
     if (s.includes(",") && s.includes(".")) {
-      // typisch deutsch: 1.234,56
       s = s.replace(/\./g, "").replace(",", ".");
     } else if (s.includes(",")) {
-      // deutsch ohne Tausenderpunkte
       s = s.replace(",", ".");
     }
     if (s.startsWith("+")) s = s.slice(1);
 
-    // Nur echte Zahlen akzeptieren (verhindert z.B. "1-2" -> 1)
     if (!/^-?\d+(\.\d+)?$/.test(s)) return s0;
 
     const n = Number.parseFloat(s);
@@ -124,8 +155,12 @@ function App() {
     return padToSix(out.map((x) => formatter(x)));
   };
 
-  // Semikolon-getrennte Zahlen (oder Zahlstrings) als *ein* Feld formatieren
-  // (links: keine 6-Spalten-Darstellung für Menge(n) und Einheitspreis).
+  // .json Erweiterung von Dateinamen entfernen
+  const removeJsonExt = (filename) => {
+    if (!filename) return filename;
+    return String(filename).replace(/\.json$/i, "");
+  };
+
   const formatSemiNumberField = (raw, { placeholder = "" } = {}) => {
     const parts = splitSemi(raw);
     if (!parts.length) return placeholder;
@@ -142,7 +177,6 @@ function App() {
 
   const getQueryPreisValue = (queryObj) => {
     if (!queryObj) return "";
-    // Hier bewusst NICHT formatPreis("---"), weil das Eingabefeld leer starten soll
     return toStr(pickFirst(queryObj, QUERY_PREIS_KEYS));
   };
 
@@ -153,7 +187,6 @@ function App() {
         if (i !== idx) return row;
         const q = row?.Query || {};
 
-        // Wenn schon ein Preis-Key existiert, verwende diesen, sonst "query-preis".
         const existingKey = QUERY_PREIS_KEYS.find((k) =>
           Object.prototype.hasOwnProperty.call(q, k)
         );
@@ -178,7 +211,7 @@ function App() {
     const files = Array.from(event.target.files || []);
     if (files.length === 0) return;
 
-    const file = files[0]; // wir nehmen die erste gewählte JSON-Datei
+    const file = files[0];
     const text = await file.text();
 
     let parsed;
@@ -195,7 +228,6 @@ function App() {
       return;
     }
 
-    // Selections aus selectedRankKey übernehmen
     const newSel = {};
     parsed.forEach((row, idx) => {
       if (
@@ -219,16 +251,13 @@ function App() {
   const setSelectionForCurrent = (rankKey) => {
     if (!currentRow) return;
 
-    // 1) Auswahl (Rank1/2/3) speichern
     setSelectionMap((prev) => ({
       ...prev,
       [currentIndex]: rankKey,
     }));
 
-    // 2) Einheitspreis der Query automatisch mit dem gewählten Rank-Preis befüllen
-    //    (damit beim Speichern auch wirklich ein Preis in der Query steht).
     const rankObj = currentRow?.[rankKey] || {};
-    const prefix = (rankKey || "").toLowerCase(); // "Rank1" -> "rank1"
+    const prefix = (rankKey || "").toLowerCase();
     const rankPreisRaw = pickFirst(rankObj, [
       `${prefix}-preis`,
       `${prefix}_preis`,
@@ -236,13 +265,12 @@ function App() {
       "unit_price",
       "unitPrice",
     ]);
-    // Gewünscht: Einheitspreis aus der *ersten Spalte* übernehmen
     const firstPreis = firstSemiValue(rankPreisRaw);
     const formattedFirst = isBlank(firstPreis) ? "" : formatNumber2(firstPreis);
     setQueryPreisForIndex(currentIndex, formattedFirst);
   };
 
-  // ---------- Speichern: JSON mit selectedRankKey ----------
+  // ---------- Speichern ----------
   const saveSelection = useCallback(() => {
     if (!data || data.length === 0) {
       setStatus("Keine Daten zum Speichern.");
@@ -251,7 +279,7 @@ function App() {
 
     const output = data.map((row, idx) => ({
       ...row,
-      selectedRankKey: selectionMap[idx] || null, // null = nichts gewählt
+      selectedRankKey: selectionMap[idx] || null,
     }));
 
     const base =
@@ -278,7 +306,7 @@ function App() {
 
   const formatPreis = (v) => (v === undefined || v === null || isBlank(v) ? "---" : toStr(v));
 
-  // ---------- Details-Renderer (Query & Ranks) ----------
+  // ---------- Details-Renderer ----------
   const renderDetailsTable = (rows) => {
     return (
       <table className="kv-table details-table">
@@ -332,7 +360,7 @@ function App() {
 
   const getRankDetails = (rankObj, rankKey) => {
     const r = rankObj || {};
-    const prefix = (rankKey || "").toLowerCase(); // "Rank1" -> "rank1"
+    const prefix = (rankKey || "").toLowerCase();
 
     return {
       quellen: pickFirst(r, [`${prefix}-quellen`, `${prefix}_quellen`, "quellen", "sources", "source"]),
@@ -350,19 +378,17 @@ function App() {
     if (!queryObj) return <div className="empty">Keine Daten</div>;
     const d = getQueryDetails(queryObj);
 
-    // Links: Menge(n) und Einheitspreis *ohne* 6-Spalten-Layout, aber sauber auf 2 Nachkommastellen.
     const mengeOneField = formatSemiNumberField(d.menge);
     const preisOneField = formatSemiNumberField(d.preis, { placeholder: "---" });
 
     return renderDetailsTable([
       { label: "Pfad", value: d.path },
-      // Links soll OZ wie früher als einzelnes Feld ganz oben stehen.
       { label: "OZ", value: d.oz },
       { label: "Kurztext", value: d.kurztext },
       { label: "Langtext", value: d.langtext, type: "textarea" },
-      { label: "Einheit", value: d.einheit },
       { label: "Menge(n)", value: mengeOneField },
-      { label: "Einheitspreis", value: preisOneField },
+      { label: "Einheit", value: d.einheit },
+      { label: "Einheitspreis in Euro", value: preisOneField },
     ]);
   };
 
@@ -370,11 +396,8 @@ function App() {
     if (!rankObj) return <div className="empty">Keine Daten</div>;
     const d = getRankDetails(rankObj, rankKey);
 
-    // Rechts: OZ soll in die 6-spaltige Darstellung (wie Menge/Einheitspreis/Quellen)
     const ozCols = buildSixCols({
       raw: d.oz,
-      // bewusst keine Replikation wie bei Menge/Preis – OZ ist i.d.R. ein Code,
-      // falls nur 1 Wert vorhanden ist, bleiben die restlichen Spalten leer.
       formatter: (x) => toStr(x),
     });
 
@@ -393,7 +416,7 @@ function App() {
     });
     const quellenCols = buildSixCols({
       raw: d.quellen,
-      formatter: (x) => toStr(x),
+      formatter: (x) => removeJsonExt(toStr(x)),
     });
 
     return renderDetailsTable([
@@ -403,13 +426,10 @@ function App() {
       { label: "Quellen", type: "six", values: quellenCols, sixKind: "text" },
       { label: "OZ", type: "six", values: ozCols, sixKind: "text" },
       { label: "Menge(n)", type: "six", values: mengeCols, sixKind: "number" },
-      { label: "Einheitspreis", type: "six", values: preisCols, sixKind: "number" },
       { label: "Einheit", value: d.einheit },
-
+      { label: "Einheitspreis in Euro", type: "six", values: preisCols, sixKind: "number" },
     ]);
   };
-
-  // ---------- Query-Tabelle (links oben) ----------
 
   const getQueryPreview = (row) => {
     const q = row?.Query || {};
@@ -446,27 +466,37 @@ function App() {
     setUploadMessage("");
 
     try {
-      const fd = new FormData();
-      // Reihenfolge ist relevant: erst Wissensbasis, dann LV zu bepreisen.
-      [...kbFiles, ...lvFiles].forEach((f) => fd.append("data", f, f.name));
+      // 1. Wissensbasis-Dateien zum ersten Webhook senden
+      const fdKb = new FormData();
+      kbFiles.forEach((f) => fdKb.append("data", f, f.name));
 
-      const res = await fetch(WEBHOOK_URL, {
+      const resKb = await fetch(WEBHOOK_WISSENSBASIS, {
         method: "POST",
-        body: fd,
+        body: fdKb,
       });
 
-      const raw = await res.text();
-      let preview = raw;
-      try {
-        const json = JSON.parse(raw);
-        preview = JSON.stringify(json);
-      } catch (_) {}
-
-      if (!res.ok) {
-        throw new Error(preview || `HTTP ${res.status}`);
+      if (!resKb.ok) {
+        const rawKb = await resKb.text();
+        throw new Error(`Wissensbasis-Upload fehlgeschlagen: ${rawKb || `HTTP ${resKb.status}`}`);
       }
 
-      setStatus(`Upload abgeschlossen (${kbFiles.length + lvFiles.length} Datei(en)).`);
+      // 2. LV-Dateien zum zweiten Webhook senden
+      const fdLv = new FormData();
+      lvFiles.forEach((f) => fdLv.append("data", f, f.name));
+
+      const resLv = await fetch(WEBHOOK_LV, {
+        method: "POST",
+        body: fdLv,
+      });
+
+      if (!resLv.ok) {
+        const rawLv = await resLv.text();
+        throw new Error(`LV-Upload fehlgeschlagen: ${rawLv || `HTTP ${resLv.status}`}`);
+      }
+
+      setStatus(
+        `Upload abgeschlossen: ${kbFiles.length} Wissensbasis-Datei(en), ${lvFiles.length} LV-Datei(en).`
+      );
       setShowUploadModal(false);
     } catch (e) {
       console.error(e);
@@ -476,11 +506,84 @@ function App() {
     }
   };
 
+  const generiereX84 = async () => {
+    if (!data || data.length === 0) {
+      setStatus("Keine Daten zum Generieren.");
+      return;
+    }
+
+    try {
+      // Aktuelle Daten mit selectedRankKey vorbereiten
+      const output = data.map((row, idx) => ({
+        ...row,
+        selectedRankKey: selectionMap[idx] || null,
+      }));
+
+      // JSON als Blob erstellen
+      const jsonBlob = new Blob([JSON.stringify(output, null, 2)], {
+        type: "application/json",
+      });
+
+      // FormData für Upload
+      const fd = new FormData();
+      const filename = inputFileName || "data.json";
+      fd.append("data", jsonBlob, filename);
+
+      setStatus("X84 wird generiert...");
+
+      const res = await fetch(WEBHOOK_X84, {
+        method: "POST",
+        body: fd,
+      });
+
+      if (!res.ok) {
+        const rawRes = await res.text();
+        throw new Error(`X84-Generierung fehlgeschlagen: ${rawRes || `HTTP ${res.status}`}`);
+      }
+
+      // Hinweis: Wenn dein Frontend auf einer anderen Origin läuft als n8n,
+      // ist Content-Disposition evtl. nur sichtbar, wenn n8n
+      // "Access-Control-Expose-Headers: Content-Disposition" setzt.
+      const contentType = (res.headers.get("Content-Type") || "").toLowerCase();
+
+      // Falls n8n aus Versehen JSON zurückgibt, nicht als Datei downloaden
+      if (contentType.includes("application/json")) {
+        const txt = await res.text();
+        setStatus(`Antwort war JSON (kein Download). Erste Zeichen: ${txt.slice(0, 300)}`);
+        return;
+      }
+
+      // Datei-Download starten
+      const blob = await res.blob();
+
+      const cd =
+        res.headers.get("Content-Disposition") ||
+        res.headers.get("content-disposition") ||
+        "";
+      const outName = parseDownloadFilename(cd, "Anfrage1.X84");
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = outName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+
+      setStatus(`X84 erfolgreich generiert & heruntergeladen: ${outName}`);
+    } catch (e) {
+      console.error(e);
+      setStatus(`Fehler bei X84-Generierung: ${e?.message || String(e)}`);
+    }
+  };
+
   return (
     <div className="app-root">
       <header className="app-header">
         <div>
           <button onClick={openUploadModal}>Upload Projekt</button>
+          <button>Start</button>
           <button
             onClick={() => {
               const input = document.getElementById("file-input");
@@ -499,6 +602,9 @@ function App() {
           />
           <button onClick={saveSelection} disabled={!data.length}>
             Save (…-selection.json)
+          </button>
+          <button onClick={generiereX84} disabled={!data.length}>
+            Generiere X84
           </button>
         </div>
         <div className="status">
@@ -562,7 +668,9 @@ function App() {
               </div>
 
               <div className="upload-hint">
-                Webhook: <span className="mono">{WEBHOOK_URL}</span>
+                Wissensbasis → <span className="mono">{WEBHOOK_WISSENSBASIS}</span>
+                <br />
+                LV zu bepreisen → <span className="mono">{WEBHOOK_LV}</span>
               </div>
 
               {uploadMessage ? (
@@ -587,18 +695,15 @@ function App() {
         </div>
       )}
 
-      {/* Inline-Fallbacks, damit die 2-Spalten-Aufteilung auch dann hält,
-          wenn Styles aus irgendeinem Grund nicht greifen sollten. */}
       <main className="app-main" style={{ display: "flex", flexDirection: "row", flexWrap: "nowrap", flex: 1, overflow: "hidden" }}>
-        {/* Linke Seite: Query */}
         <section
           className="left-panel"
           style={{ flex: "0 0 40%", minWidth: 0, borderRight: "1px solid #e5e7eb", padding: 12, boxSizing: "border-box", display: "flex", flexDirection: "column" }}
         >
           <div className="left-title-row">
-            <h2>Zu bepreisende LV</h2>
+            <h2>LV zu bepreisen</h2>
             <div className="unitprice-inline" aria-label="Einheitspreis Eingabe">
-              <span className="unitprice-label">Einheitspreis</span>
+              <span className="unitprice-label">Einheitspreis in Euro</span>
               <input
                 className="unitprice-input"
                 type="text"
@@ -613,7 +718,6 @@ function App() {
             Zeile {data.length ? currentIndex + 1 : 0} / {data.length}
           </div>
 
-          {/* Scrollbare Tabelle: zeigt immer nur einen Ausschnitt (z.B. 5 Zeilen) */}
           <div className="query-table-wrapper" aria-label="Query Liste">
             <table className="query-table">
               <colgroup>
@@ -677,7 +781,6 @@ function App() {
           </div>
         </section>
 
-        {/* Rechte Seite: Rank-Karten */}
         <section
           className="right-panel"
           style={{ flex: "1 1 auto", minWidth: 0, padding: 12, boxSizing: "border-box", display: "flex", flexDirection: "column" }}
