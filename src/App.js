@@ -9,43 +9,18 @@ const WEBHOOK_LV = "http://localhost:5678/webhook/60b65bb0-3f9d-4f1c-8f4f-aa982e
 const WEBHOOK_X84 = "http://localhost:5678/webhook/f12d2ee2-9885-4204-91e0-4b6d3fa0c2bf";
 
 
+// Big Workflow (asynchron: Start → Status Polling → Result)
+// ⚠️ Passe WEBHOOK_BIG_START an deinen n8n Start-Webhook an (Hauptworkflow-Vergleich).
+const WEBHOOK_BIG_START = "http://localhost:5678/webhook/bac5be33-1591-45ce-89b5-0d0514aa1a6e";
 
-// Hilfsfunktion: Dateiname aus Content-Disposition lesen (für Downloads)
-const parseDownloadFilename = (contentDisposition, fallback = "Anfrage1.X84") => {
-  if (!contentDisposition) return fallback;
-
-  // RFC 5987 / 6266: filename*=UTF-8''...
-  const mStar = contentDisposition.match(/filename\*\s*=\s*([^;]+)/i);
-  if (mStar && mStar[1]) {
-    let v = mStar[1].trim();
-    v = v.replace(/^"(.*)"$/, "$1");
-
-    const parts = v.split("''"); // z.B. UTF-8''Anfrage1.X84
-    if (parts.length === 2) {
-      try {
-        return (decodeURIComponent(parts[1]).split(/[\\/]/).pop() || fallback);
-      } catch {
-        return (parts[1].split(/[\\/]/).pop() || fallback);
-      }
-    }
-
-    try {
-      return (decodeURIComponent(v).split(/[\\/]/).pop() || fallback);
-    } catch {
-      return (v.split(/[\\/]/).pop() || fallback);
-    }
-  }
-
-  // filename="..."
-  const m = contentDisposition.match(/filename\s*=\s*([^;]+)/i);
-  if (m && m[1]) {
-    let v = m[1].trim();
-    v = v.replace(/^"(.*)"$/, "$1");
-    return (v.split(/[\\/]/).pop() || fallback);
-  }
-
-  return fallback;
-};
+// Fallbacks für Status/Result, falls der Start-Webhook falsche URLs zurückliefert.
+// Bei Webhooks mit Parametern hängt n8n oft eine UUID zwischen /webhook und deinem Pfad.
+// Beispiel (bei dir per curl getestet):
+//   http://localhost:5678/webhook/6a1d9532-6f66-48d4-8722-edaabbfd3115/job/status/206
+const WEBHOOK_STATUS_BASE_FALLBACK =
+  "http://localhost:5678/webhook/6a1d9532-6f66-48d4-8722-edaabbfd3115/job/status/";
+const WEBHOOK_RESULT_BASE_FALLBACK =
+  "http://localhost:5678/webhook/ffb126b7-6265-4461-aca4-02a9d06febeb/job/result/";
 
 function App() {
   const [data, setData] = useState([]);
@@ -54,6 +29,16 @@ function App() {
   const [selectionMap, setSelectionMap] = useState({});
   const [inputFileName, setInputFileName] = useState(null);
   const [status, setStatus] = useState("");
+
+
+// Big-Workflow Job State
+const [jobRunning, setJobRunning] = useState(false);
+const [jobId, setJobId] = useState(null);
+const [jobStatusUrl, setJobStatusUrl] = useState("");
+const [jobResultUrl, setJobResultUrl] = useState("");
+const [jobProgress, setJobProgress] = useState(null);
+const [jobStatusObj, setJobStatusObj] = useState("");
+const [jobError, setJobError] = useState("");
 
   // Upload-Projekt Modal
   const [showUploadModal, setShowUploadModal] = useState(false);
@@ -160,6 +145,64 @@ function App() {
     if (!filename) return filename;
     return String(filename).replace(/\.json$/i, "");
   };
+
+
+// ---------- Big Workflow Helper ----------
+const safeJsonParse = (text) => {
+  if (text === null || text === undefined) return null;
+  const t = String(text).trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return text;
+  }
+};
+
+const readResponseAsJsonOrText = async (res) => {
+  const txt = await res.text();
+  return safeJsonParse(txt);
+};
+
+// n8n antwortet je nach Node manchmal als {data:[...]} Wrapper
+const unwrapN8nData = (payload) => {
+  if (payload && typeof payload === "object" && Array.isArray(payload.data)) {
+    // Bei Status: [{StatusObj, progress}]  |  Bei Result: [rows...]
+    return payload.data;
+  }
+  return payload;
+};
+
+const normalizeJobUrls = ({ id, statusUrl, resultUrl }) => {
+  const sid = String(id ?? "").trim();
+
+  let sUrl = String(statusUrl ?? "").trim();
+  let rUrl = String(resultUrl ?? "").trim();
+
+  // Wenn Start-Webhook fälschlich /webhook/job/status/... liefert, reparieren.
+  if (sUrl.includes("/webhook/job/status/") || !sUrl) {
+    sUrl = WEBHOOK_STATUS_BASE_FALLBACK + sid;
+  }
+  if (rUrl.includes("/webhook/job/result/") || !rUrl) {
+    rUrl = WEBHOOK_RESULT_BASE_FALLBACK + sid;
+  }
+
+  return { sUrl, rUrl };
+};
+
+const downloadJsonBlob = (obj, filename = "result.json") => {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+};
 
   const formatSemiNumberField = (raw, { placeholder = "" } = {}) => {
     const parts = splitSemi(raw);
@@ -506,6 +549,174 @@ function App() {
     }
   };
 
+
+// ---------- Big Workflow Start + Polling ----------
+const startBigWorkflow = async () => {
+  if (jobRunning) return;
+
+  setJobError("");
+  setJobStatusObj("");
+  setJobProgress(null);
+
+  setStatus("Workflow wird gestartet...");
+  setJobRunning(true);
+
+  try {
+    // POST ohne Body -> kein CORS Preflight (meist stabiler)
+    const res = await fetch(WEBHOOK_BIG_START, { method: "POST" });
+
+    if (!res.ok) {
+      const raw = await res.text();
+      throw new Error(raw || `HTTP ${res.status}`);
+    }
+
+    let payload = await readResponseAsJsonOrText(res);
+
+    // Falls n8n eine JSON-String-Literal zurückgibt: nochmals parsen
+    if (typeof payload === "string") {
+      const p2 = safeJsonParse(payload);
+      if (p2 && typeof p2 === "object") payload = p2;
+    }
+
+    const jobIdFromPayload = payload?.jobId ?? payload?.id ?? payload?.executionId ?? null;
+    if (jobIdFromPayload === null || jobIdFromPayload === undefined || jobIdFromPayload === "") {
+      throw new Error("Start-Antwort enthält keine jobId.");
+    }
+
+    const id = String(jobIdFromPayload);
+    const { sUrl, rUrl } = normalizeJobUrls({
+      id,
+      statusUrl: payload?.statusUrl,
+      resultUrl: payload?.resultUrl,
+    });
+
+    setJobId(id);
+    setJobStatusUrl(sUrl);
+    setJobResultUrl(rUrl);
+
+    setStatus(`Workflow gestartet. JobId=${id}. Warte auf Status...`);
+  } catch (e) {
+    console.error(e);
+    setJobError(e?.message || String(e));
+    setStatus(`Fehler beim Start: ${e?.message || String(e)}`);
+    setJobRunning(false);
+  }
+};
+
+// Polling: sobald jobRunning + jobStatusUrl gesetzt ist
+useEffect(() => {
+  if (!jobRunning || !jobId || !jobStatusUrl) return;
+
+  let cancelled = false;
+  const ac = new AbortController();
+
+  const pollOnce = async () => {
+    try {
+      const res = await fetch(jobStatusUrl, { method: "GET", signal: ac.signal });
+
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(raw || `HTTP ${res.status}`);
+      }
+
+      const payload = await readResponseAsJsonOrText(res);
+      const unwrapped = unwrapN8nData(payload);
+
+      // Status-Workflow liefert i.d.R. {data:[{StatusObj, progress}]}
+      let statusObj = "";
+      let progress = null;
+
+      if (Array.isArray(unwrapped) && unwrapped.length > 0 && typeof unwrapped[0] === "object") {
+        statusObj = unwrapped[0]?.StatusObj ?? unwrapped[0]?.status ?? "";
+        progress = unwrapped[0]?.progress ?? null;
+      } else if (unwrapped && typeof unwrapped === "object") {
+        statusObj = unwrapped?.StatusObj ?? unwrapped?.status ?? "";
+        progress = unwrapped?.progress ?? null;
+      }
+
+      if (!cancelled) {
+        setJobStatusObj(String(statusObj || ""));
+        setJobProgress(progress);
+
+        const pTxt = progress === null || progress === undefined ? "" : ` (${progress}%)`;
+        setStatus(`Job ${jobId}: ${statusObj || "läuft..."}${pTxt}`);
+      }
+
+      const done =
+        String(statusObj || "").toLowerCase() === "done" ||
+        String(statusObj || "").toLowerCase() === "finished" ||
+        (typeof progress === "number" && progress >= 100) ||
+        String(progress) === "100";
+
+      if (done) {
+        // Result holen + in App laden + Download anbieten
+        const res2 = await fetch(jobResultUrl, { method: "GET", signal: ac.signal });
+
+        if (!res2.ok) {
+          const raw2 = await res2.text();
+          throw new Error(raw2 || `HTTP ${res2.status}`);
+        }
+
+        const payload2 = await readResponseAsJsonOrText(res2);
+        const resultUnwrapped = unwrapN8nData(payload2);
+
+        // In der App laden (gleiche Logik wie Open JSON)
+        let rows = [];
+        if (Array.isArray(resultUnwrapped)) {
+          rows = resultUnwrapped;
+        } else if (resultUnwrapped && typeof resultUnwrapped === "object") {
+          // Falls result nur ein Objekt ist, als 1-Zeiler anzeigen
+          rows = [resultUnwrapped];
+        }
+
+        // selectionMap aus evtl. selectedRankKey übernehmen
+        const newSel = {};
+        rows.forEach((row, idx) => {
+          if (
+            row &&
+            typeof row.selectedRankKey === "string" &&
+            RANK_KEYS.includes(row.selectedRankKey)
+          ) {
+            newSel[idx] = row.selectedRankKey;
+          }
+        });
+
+        if (!cancelled) {
+          setData(rows);
+          setSelectionMap(newSel);
+          setInputFileName(`job-${jobId}-result.json`);
+          setCurrentIndex(0);
+          setActiveRankTab("Rank1");
+
+          setStatus(`Job ${jobId}: done (100%). Ergebnis geladen (${rows.length} Zeilen).`);
+
+          // Automatisch JSON herunterladen (so wie du es wolltest)
+          downloadJsonBlob(rows, `match_report_job-${jobId}.json`);
+        }
+
+        if (!cancelled) setJobRunning(false);
+        return;
+      }
+
+      // Nächster Poll
+      if (!cancelled) setTimeout(pollOnce, 1200);
+    } catch (e) {
+      if (cancelled) return;
+      console.error(e);
+      setJobError(e?.message || String(e));
+      setStatus(`Polling Fehler (Job ${jobId}): ${e?.message || String(e)}`);
+      setJobRunning(false);
+    }
+  };
+
+  pollOnce();
+
+  return () => {
+    cancelled = true;
+    ac.abort();
+  };
+}, [jobRunning, jobId, jobStatusUrl, jobResultUrl]);  
+
   const generiereX84 = async () => {
     if (!data || data.length === 0) {
       setStatus("Keine Daten zum Generieren.");
@@ -541,37 +752,7 @@ function App() {
         throw new Error(`X84-Generierung fehlgeschlagen: ${rawRes || `HTTP ${res.status}`}`);
       }
 
-      // Hinweis: Wenn dein Frontend auf einer anderen Origin läuft als n8n,
-      // ist Content-Disposition evtl. nur sichtbar, wenn n8n
-      // "Access-Control-Expose-Headers: Content-Disposition" setzt.
-      const contentType = (res.headers.get("Content-Type") || "").toLowerCase();
-
-      // Falls n8n aus Versehen JSON zurückgibt, nicht als Datei downloaden
-      if (contentType.includes("application/json")) {
-        const txt = await res.text();
-        setStatus(`Antwort war JSON (kein Download). Erste Zeichen: ${txt.slice(0, 300)}`);
-        return;
-      }
-
-      // Datei-Download starten
-      const blob = await res.blob();
-
-      const cd =
-        res.headers.get("Content-Disposition") ||
-        res.headers.get("content-disposition") ||
-        "";
-      const outName = parseDownloadFilename(cd, "Anfrage1.X84");
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = outName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-
-      setStatus(`X84 erfolgreich generiert & heruntergeladen: ${outName}`);
+      setStatus("X84 erfolgreich generiert!");
     } catch (e) {
       console.error(e);
       setStatus(`Fehler bei X84-Generierung: ${e?.message || String(e)}`);
@@ -583,7 +764,7 @@ function App() {
       <header className="app-header">
         <div>
           <button onClick={openUploadModal}>Upload Projekt</button>
-          <button>Start</button>
+          <button onClick={startBigWorkflow} disabled={jobRunning}>Start</button>
           <button
             onClick={() => {
               const input = document.getElementById("file-input");
@@ -607,9 +788,31 @@ function App() {
             Generiere X84
           </button>
         </div>
-        <div className="status">
-          {status}
-        </div>
+
+<div className="status">
+  <div>{status}</div>
+  {jobRunning && (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ fontSize: 12, opacity: 0.8 }}>
+        {jobStatusObj ? `Status: ${jobStatusObj}` : "Status: ..."}{jobProgress !== null && jobProgress !== undefined ? ` | Fortschritt: ${jobProgress}%` : ""}
+      </div>
+      <div style={{ height: 8, border: "1px solid #d1d5db", borderRadius: 6, overflow: "hidden", marginTop: 4 }}>
+        <div
+          style={{
+            height: "100%",
+            width: `${Math.max(0, Math.min(100, Number(jobProgress ?? 0)))}%`,
+            background: "#111827",
+          }}
+        />
+      </div>
+    </div>
+  )}
+  {!jobRunning && jobError ? (
+    <div style={{ marginTop: 6, fontSize: 12, color: "#b91c1c" }}>
+      {jobError}
+    </div>
+  ) : null}
+</div>
       </header>
 
       {showUploadModal && (
