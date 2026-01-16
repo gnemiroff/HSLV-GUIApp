@@ -1,15 +1,27 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import "./styles.css";
 
 const RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
 
-// Webhooks
-// 1) Start Project: erzeugt eine jobId und liefert dynamische URLs für Uploads + Start
-const WEBHOOK_START_PROJECT =
-  "http://localhost:5678/webhook/8b918e0c-f8b2-43e1-a142-e21751cc08f4";
-
-// 2) X84 Generator (optional)
+// Drei separate Webhooks
+const WEBHOOK_WISSENSBASIS = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
+const WEBHOOK_LV = "http://localhost:5678/webhook/60b65bb0-3f9d-4f1c-8f4f-aa982e5ea5b7";
 const WEBHOOK_X84 = "http://localhost:5678/webhook/f12d2ee2-9885-4204-91e0-4b6d3fa0c2bf";
+
+const WEBHOOK_START_PROJECT = "http://localhost:5678/webhook/8b918e0c-f8b2-43e1-a142-e21751cc08f4";
+
+// Polling: passe diese beiden Webhook-IDs an deine Status/Result-Workflows an
+const WEBHOOK_STATUS_BASE = "http://localhost:5678/webhook/6a1d9532-6f66-48d4-8722-edaabbfd3115/job/status";
+const WEBHOOK_RESULT_BASE = "http://localhost:5678/webhook/ffb126b7-6265-4461-aca4-02a9d06febeb/job/result";
+
+// Helper: baut URL inkl. jobId
+const buildStatusUrl = (jobId) => `${WEBHOOK_STATUS_BASE}/${jobId}`;
+const buildResultUrl = (jobId) => `${WEBHOOK_RESULT_BASE}/${jobId}`;
+
+// Upload (z.B. priced JSON -> X84). Erwarteter Pfad: /job/x84/:jobId (Workflow musst du entsprechend anlegen)
+const buildX84Url = (jobId) => `${WEBHOOK_X84}/job/x84/${jobId}`;
+
+
 function App() {
   const [data, setData] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -18,6 +30,19 @@ function App() {
   const [inputFileName, setInputFileName] = useState(null);
   const [status, setStatus] = useState("");
 
+  // Projekt/Job-Kontext (kommt vom "Start Project" Webhook)
+  // { jobId, kbUrl, lvUrl, startUrl, statusUrl, resultUrl, x84Url }
+  const [project, setProject] = useState(null);
+
+  // Analyse-Status
+  const [analysisRunning, setAnalysisRunning] = useState(false);
+  const [analysisProgress, setAnalysisProgress] = useState(null);
+  const [analysisText, setAnalysisText] = useState("");
+
+  // Polling-Abbruch (z.B. beim Unmount)
+  const pollAbortRef = useRef({ aborted: false });
+
+
   // Upload-Projekt Modal
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [kbFiles, setKbFiles] = useState([]);
@@ -25,13 +50,15 @@ function App() {
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
 
-
-  // Projekt-Job (wird beim Klick auf "Hochladen" per Start-Project-Webhook erzeugt)
-  // Struktur: { jobId, kbUrl, lvUrl, startUrl }
-  const [projectInfo, setProjectInfo] = useState(null);
-  const [projectReady, setProjectReady] = useState(false);
-  const [startBusy, setStartBusy] = useState(false);
   const currentRow = data[currentIndex] || null;
+
+  useEffect(() => {
+    return () => {
+      // Stoppt laufendes Polling beim Unmount
+      pollAbortRef.current.aborted = true;
+    };
+  }, []);
+
 
   useEffect(() => {
     setActiveRankTab("Rank1");
@@ -424,88 +451,80 @@ function App() {
     setShowUploadModal(false);
   };
 
+  const unwrapN8nData = (payload) => {
+    if (!payload) return payload;
+    // Viele n8n-Nodes (Extract from File) liefern { data: [ ... ] }
+    if (payload && typeof payload === "object" && Array.isArray(payload.data) && payload.data.length === 1) {
+      return payload.data[0];
+    }
+    return payload;
+  };
+
   const uploadProjekt = async () => {
     if (uploadBusy) return;
+
     if (!kbFiles.length || !lvFiles.length) {
       setUploadMessage("Bitte wähle in beiden Bereichen mindestens eine Datei aus.");
       return;
     }
 
     setUploadBusy(true);
-    setProjectReady(false);
-    setUploadMessage("Erzeuge Job-ID...");
+    setUploadMessage("");
 
     try {
-      // 0) Job erzeugen und Job-URLs vom Start-Project-Webhook holen
-      const resInit = await fetch(WEBHOOK_START_PROJECT, {
-        method: "POST",
-      });
+      setUploadMessage("Projekt wird initialisiert (Job-ID wird erzeugt)...");
 
-      if (!resInit.ok) {
-        const raw = await resInit.text();
-        throw new Error(`Start-Project fehlgeschlagen: ${raw || `HTTP ${resInit.status}`}`);
+      // 0) Job / URLs anfordern (Start Project)
+      const initRes = await fetch(WEBHOOK_START_PROJECT, { method: "POST" });
+      if (!initRes.ok) {
+        const raw = await initRes.text();
+        throw new Error(`StartProject fehlgeschlagen: ${raw || `HTTP ${initRes.status}`}`);
       }
 
-      // n8n kann je nach Response-Mode entweder direkt ein Objekt oder { data: [...] } zurückgeben
-      let initPayload = null;
-      try {
-        initPayload = await resInit.json();
-      } catch (e) {
-        const t = await resInit.text();
-        initPayload = t ? JSON.parse(t) : null;
-      }
+      const initPayload = await initRes.json();
+      const initObj = unwrapN8nData(initPayload);
 
-      const init =
-        (initPayload && Array.isArray(initPayload.data) && initPayload.data[0]) || initPayload;
-
-      const jobId = init?.jobId ?? init?.jobID ?? init?.id;
-      const kbUrl = init?.kbUrl;
-      const lvUrl = init?.lvUrl;
-      const startUrl = init?.startUrl;
+      const jobId = String(initObj?.jobId ?? initObj?.jobID ?? initObj?.id ?? "").trim();
+      const kbUrl = String(initObj?.kbUrl ?? "").trim();
+      const lvUrl = String(initObj?.lvUrl ?? "").trim();
+      const startUrl = String(initObj?.startUrl ?? "").trim();
 
       if (!jobId || !kbUrl || !lvUrl || !startUrl) {
-        throw new Error(
-          `Start-Project lieferte keine gültigen URLs. Antwort: ${JSON.stringify(initPayload)}`
-        );
+        throw new Error(`StartProject liefert keine gültigen URLs. Antwort: ${JSON.stringify(initObj)}`);
       }
 
-      // URLs im Client speichern (Start-Button nutzt später startUrl)
-      setProjectInfo({ jobId, kbUrl, lvUrl, startUrl });
+      // 1) Polling URLs (entweder vom Server oder lokal aus jobId bauen)
+      const statusUrl = String(initObj?.statusUrl ?? buildStatusUrl(jobId));
+      const resultUrl = String(initObj?.resultUrl ?? buildResultUrl(jobId));
 
-      // 1) Wissensbasis-Dateien hochladen
-      setUploadMessage(`Job ${jobId} erstellt. Lade Wissensbasis hoch...`);
+      // 2) Upload-URL für priced-json/X84 (Workflow musst du entsprechend bauen)
+      const x84Url = String(initObj?.x84Url ?? initObj?.pricedJsonUrl ?? buildX84Url(jobId));
+
+      setProject({ jobId, kbUrl, lvUrl, startUrl, statusUrl, resultUrl, x84Url });
+
+      // 3) Wissensbasis-Dateien hochladen (KB)
+      setUploadMessage(`Job ${jobId}: Upload Wissensbasis...`);
       const fdKb = new FormData();
       kbFiles.forEach((f) => fdKb.append("data", f, f.name));
 
-      const resKb = await fetch(kbUrl, {
-        method: "POST",
-        body: fdKb,
-      });
-
+      const resKb = await fetch(kbUrl, { method: "POST", body: fdKb });
       if (!resKb.ok) {
         const rawKb = await resKb.text();
         throw new Error(`Wissensbasis-Upload fehlgeschlagen: ${rawKb || `HTTP ${resKb.status}`}`);
       }
 
-      // 2) LV-Dateien hochladen
-      setUploadMessage(`Wissensbasis hochgeladen. Lade LV hoch...`);
+      // 4) LV-Dateien hochladen
+      setUploadMessage(`Job ${jobId}: Upload LV...`);
       const fdLv = new FormData();
       lvFiles.forEach((f) => fdLv.append("data", f, f.name));
 
-      const resLv = await fetch(lvUrl, {
-        method: "POST",
-        body: fdLv,
-      });
-
+      const resLv = await fetch(lvUrl, { method: "POST", body: fdLv });
       if (!resLv.ok) {
         const rawLv = await resLv.text();
         throw new Error(`LV-Upload fehlgeschlagen: ${rawLv || `HTTP ${resLv.status}`}`);
       }
 
-      setProjectReady(true);
-      setStatus(
-        `Upload abgeschlossen (Job ${jobId}): ${kbFiles.length} Wissensbasis-Datei(en), ${lvFiles.length} LV-Datei(en).`
-      );
+      setStatus(`Projekt ${jobId} bereit. Upload: ${kbFiles.length} KB-Datei(en), ${lvFiles.length} LV-Datei(en).`);
       setShowUploadModal(false);
       setUploadMessage("");
     } catch (e) {
@@ -516,43 +535,143 @@ function App() {
     }
   };
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const downloadJson = (obj, filename) => {
+    try {
+      const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.warn('Download JSON fehlgeschlagen', e);
+    }
+  };
+
   const startAnalyse = async () => {
-    const startUrl = projectInfo?.startUrl;
-    const jobId = projectInfo?.jobId;
+    if (analysisRunning) return;
+    const jobId = project?.jobId;
+    if (!jobId) {
+      setStatus('Bitte zuerst ein Projekt hochladen (Job-ID fehlt).');
+      return;
+    }
+
+    const startUrl = project?.startUrl;
+    const statusUrl = project?.statusUrl || buildStatusUrl(jobId);
+    const resultUrl = project?.resultUrl || buildResultUrl(jobId);
 
     if (!startUrl) {
-      setStatus("Bitte zuerst ein Projekt hochladen (Upload Projekt → Hochladen).");
+      setStatus('Start-URL fehlt. Bitte Projekt erneut hochladen.');
       return;
     }
-    if (!projectReady) {
-      setStatus("Bitte zuerst den Upload abschließen, bevor du auf Start klickst.");
-      return;
-    }
-    if (startBusy) return;
 
-    setStartBusy(true);
+    // 1) Analyse starten (muss dieselbe jobId verwenden wie Upload!)
+    setAnalysisRunning(true);
+    setAnalysisProgress(0);
+    setAnalysisText('Analyse wird gestartet...');
+    setStatus(`Job ${jobId}: Start...`);
+    pollAbortRef.current.aborted = false;
+
     try {
-      setStatus(`Starte Analyse (Job ${jobId})...`);
-
-      // Standardmäßig POST. Falls dein Webhook GET erwartet, kannst du hier auf GET umstellen.
-      let res = await fetch(startUrl, { method: "POST" });
-
-      // Fallback: Falls POST nicht erlaubt ist (z.B. 405), probiere GET
-      if (!res.ok && (res.status === 405 || res.status === 404)) {
-        res = await fetch(startUrl, { method: "GET" });
+      const resStart = await fetch(startUrl, { method: 'POST' });
+      if (!resStart.ok) {
+        const raw = await resStart.text();
+        throw new Error(`Start fehlgeschlagen: ${raw || `HTTP ${resStart.status}`}`);
       }
 
-      if (!res.ok) {
-        const raw = await res.text();
-        throw new Error(raw || `HTTP ${res.status}`);
+      // Optional: Start-Workflow kann statusUrl/resultUrl zurückgeben -> übernehmen
+      try {
+        const maybe = await resStart.json();
+        const obj = unwrapN8nData(maybe);
+        if (obj && (obj.statusUrl || obj.resultUrl || obj.x84Url || obj.pricedJsonUrl)) {
+          setProject((prev) => ({
+            ...(prev || {}),
+            statusUrl: obj.statusUrl || prev?.statusUrl || statusUrl,
+            resultUrl: obj.resultUrl || prev?.resultUrl || resultUrl,
+            x84Url: obj.x84Url || obj.pricedJsonUrl || prev?.x84Url,
+          }));
+        }
+      } catch (_) {
+        // ok: Start-Response ist evtl. leer oder kein JSON
       }
 
-      setStatus(`Analyse gestartet (Job ${jobId}).`);
+      // 2) Polling (Status) – URL muss jobId enthalten
+      let consecutiveErrors = 0;
+      while (!pollAbortRef.current.aborted) {
+        const resStatus = await fetch(statusUrl, { method: 'GET' });
+
+        if (!resStatus.ok) {
+          consecutiveErrors += 1;
+          // Viele Setups liefern kurzzeitig 404/500 bis status.json existiert -> weiter probieren
+          if (consecutiveErrors >= 8) {
+            const raw = await resStatus.text().catch(() => '');
+            throw new Error(`Status Polling fehlgeschlagen: ${raw || `HTTP ${resStatus.status}`}`);
+          }
+          await sleep(1000);
+          continue;
+        }
+
+        consecutiveErrors = 0;
+        const statusPayload = await resStatus.json();
+        const st = unwrapN8nData(statusPayload) || {};
+        const txt = st.StatusObj || st.status || st.message || '';
+        const progRaw = st.progress ?? st.Progress ?? st.percent ?? st.percentage;
+        const prog = Number.isFinite(Number(progRaw)) ? Number(progRaw) : 0;
+
+        setAnalysisText(String(txt));
+        setAnalysisProgress(prog);
+        setStatus(`Job ${jobId}: ${txt}${Number.isFinite(prog) ? ` (${prog}%)` : ''}`);
+
+        const doneByProgress = prog >= 100;
+        const doneByText = String(txt).toLowerCase().includes('done') || String(txt).toLowerCase().includes('fertig');
+        if (doneByProgress || doneByText) break;
+
+        await sleep(1000);
+      }
+
+      if (pollAbortRef.current.aborted) return;
+
+      // 3) Ergebnis laden – URL muss jobId enthalten
+      setStatus(`Job ${jobId}: Ergebnis wird geladen...`);
+      const resResult = await fetch(resultUrl, { method: 'GET' });
+      if (!resResult.ok) {
+        const raw = await resResult.text();
+        throw new Error(`Result Abruf fehlgeschlagen: ${raw || `HTTP ${resResult.status}`}`);
+      }
+
+      const resultPayload = await resResult.json();
+      const resultObj = unwrapN8nData(resultPayload);
+      const rows = Array.isArray(resultPayload?.data) ? resultPayload.data : (Array.isArray(resultObj) ? resultObj : (resultObj?.data && Array.isArray(resultObj.data) ? resultObj.data : []));
+
+      if (!Array.isArray(rows) || rows.length === 0) {
+        setStatus(`Job ${jobId}: Ergebnis ist leer oder nicht als Array angekommen.`);
+      }
+
+      setData(Array.isArray(rows) ? rows : []);
+      setCurrentIndex(0);
+
+      // selectedRankKey wieder in selectionMap übernehmen, falls im Ergebnis enthalten
+      const map = {};
+      (Array.isArray(rows) ? rows : []).forEach((r, i) => {
+        if (r && r.selectedRankKey) map[i] = r.selectedRankKey;
+      });
+      setSelectionMap(map);
+
+      const filename = `job-${jobId}-result.json`;
+      setInputFileName(filename);
+      downloadJson(rows, filename);
+
+      setStatus(`Job ${jobId}: Analyse abgeschlossen. Ergebnis geladen.`);
     } catch (e) {
       console.error(e);
-      setStatus(`Fehler beim Starten: ${e?.message || String(e)}`);
+      setStatus(`Job ${project?.jobId || ''}: Fehler beim Start/Polling: ${e?.message || String(e)}`);
     } finally {
-      setStartBusy(false);
+      setAnalysisRunning(false);
     }
   };
 
@@ -581,7 +700,13 @@ function App() {
 
       setStatus("X84 wird generiert...");
 
-      const res = await fetch(WEBHOOK_X84, {
+      const jobId = project?.jobId;
+      const uploadUrl = project?.x84Url || (jobId ? buildX84Url(jobId) : "");
+      if (!uploadUrl) {
+        throw new Error("Kein Job vorhanden: Bitte zuerst Projekt hochladen, damit die jobId in der Upload-URL steckt.");
+      }
+
+      const res = await fetch(uploadUrl, {
         method: "POST",
         body: fd,
       });
@@ -603,8 +728,8 @@ function App() {
       <header className="app-header">
         <div>
           <button onClick={openUploadModal}>Upload Projekt</button>
-          <button onClick={startAnalyse} disabled={!projectInfo?.startUrl || !projectReady || startBusy}>
-            {startBusy ? "Start läuft..." : "Start"}
+          <button onClick={startAnalyse} disabled={!project?.startUrl || analysisRunning}>
+            Start{project?.jobId ? ` (Job ${project.jobId})` : ""}
           </button>
           <button
             onClick={() => {
@@ -690,28 +815,9 @@ function App() {
               </div>
 
               <div className="upload-hint">
-                <div>
-                  Start-Project (Job-ID & URLs) →{" "}
-                  <span className="mono">{WEBHOOK_START_PROJECT}</span>
-                </div>
-
-                {projectInfo ? (
-                  <>
-                    <div>
-                      jobId → <span className="mono">{projectInfo.jobId}</span>
-                    </div>
-                    <div>
-                      KB Upload URL → <span className="mono">{projectInfo.kbUrl}</span>
-                    </div>
-                    <div>
-                      LV Upload URL → <span className="mono">{projectInfo.lvUrl}</span>
-                    </div>
-                    <div>
-                      Start URL (für Start-Button) →{" "}
-                      <span className="mono">{projectInfo.startUrl}</span>
-                    </div>
-                  </>
-                ) : null}
+                Wissensbasis → <span className="mono">{WEBHOOK_WISSENSBASIS}</span>
+                <br />
+                LV zu bepreisen → <span className="mono">{WEBHOOK_LV}</span>
               </div>
 
               {uploadMessage ? (
