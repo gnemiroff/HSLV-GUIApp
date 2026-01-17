@@ -23,6 +23,8 @@ const buildX84Url = (jobId) => `${WEBHOOK_X84}/job/x84/${jobId}`;
 
 
 function App() {
+  // German 17.01.26
+  const [jobId, setJobId] = useState("");
   const [data, setData] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [activeRankTab, setActiveRankTab] = useState("Rank1");
@@ -676,52 +678,71 @@ function App() {
   };
 
   const generiereX84 = async () => {
-    if (!data || data.length === 0) {
-      setStatus("Keine Daten zum Generieren.");
+  if (!data || data.length === 0) {
+    setStatus("Keine Daten zum Generieren.");
+    return;
+  }
+
+  // ✅ JobId sicherstellen (minimal: prompt)
+  let jid = (jobId || "").trim();
+  if (!jid) {
+    jid = (window.prompt("Bitte Job-ID eingeben (z.B. 3974):") || "").trim();
+    if (!jid) {
+      setStatus("Abgebrochen: keine Job-ID angegeben.");
       return;
     }
+    setJobId(jid);
+  }
 
-    try {
-      // Aktuelle Daten mit selectedRankKey vorbereiten
-      const output = data.map((row, idx) => ({
-        ...row,
-        selectedRankKey: selectionMap[idx] || null,
-      }));
+  // ✅ WICHTIG: richtiger Endpoint inkl. Pfad + jobId
+  const x84Url = `${WEBHOOK_X84}/job/x84/${encodeURIComponent(jid)}`;
 
-      // JSON als Blob erstellen
-      const jsonBlob = new Blob([JSON.stringify(output, null, 2)], {
-        type: "application/json",
-      });
+  try {
+    const output = data.map((row, idx) => ({
+      ...row,
+      selectedRankKey: selectionMap[idx] || null,
+    }));
 
-      // FormData für Upload
-      const fd = new FormData();
-      const filename = inputFileName || "data.json";
-      fd.append("data", jsonBlob, filename);
+    const jsonBlob = new Blob([JSON.stringify(output, null, 2)], {
+      type: "application/json",
+    });
 
-      setStatus("X84 wird generiert...");
+    const fd = new FormData();
 
-      const jobId = project?.jobId;
-      const uploadUrl = project?.x84Url || (jobId ? buildX84Url(jobId) : "");
-      if (!uploadUrl) {
-        throw new Error("Kein Job vorhanden: Bitte zuerst Projekt hochladen, damit die jobId in der Upload-URL steckt.");
-      }
+    // ✅ Optional aber sinnvoll: exakt so benennen wie der Workflow es ablegt
+    fd.append("data", jsonBlob, "GUI_priced.json");
 
-      const res = await fetch(uploadUrl, {
-        method: "POST",
-        body: fd,
-      });
+    setStatus("X84 wird generiert...");
 
-      if (!res.ok) {
-        const rawRes = await res.text();
-        throw new Error(`X84-Generierung fehlgeschlagen: ${rawRes || `HTTP ${res.status}`}`);
-      }
+    const res = await fetch(x84Url, {
+      method: "POST",
+      body: fd,
+    });
 
-      setStatus("X84 erfolgreich generiert!");
-    } catch (e) {
-      console.error(e);
-      setStatus(`Fehler bei X84-Generierung: ${e?.message || String(e)}`);
+    if (!res.ok) {
+      const rawRes = await res.text();
+      throw new Error(`X84-Generierung fehlgeschlagen: ${rawRes || `HTTP ${res.status}`}`);
     }
-  };
+
+    // ✅ wichtig: Webhook antwortet BINARY -> du musst es herunterladen
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "Anfrage.X84";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    setStatus(`X84 erfolgreich generiert (Job ${jid}) und heruntergeladen.`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Fehler bei X84-Generierung: ${e?.message || String(e)}`);
+  }
+ };
+
 
   return (
     <div className="app-root">
