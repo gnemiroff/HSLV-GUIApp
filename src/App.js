@@ -304,6 +304,44 @@ function App() {
 
   const formatPreis = (v) => (v === undefined || v === null || isBlank(v) ? "---" : toStr(v));
 
+
+
+  // ---------- Rank-Score (für Titel/Tab) ----------
+  // In deiner JSON steckt der Score pro Rank typischerweise als: rank1_score / rank2_score / rank3_score
+  // (also lower-case + "_score").
+  const getRankScoreRaw = (rankObj, rankKey) => {
+    const r = rankObj || {};
+    const prefix = (rankKey || "").toLowerCase();
+    return pickFirst(r, [`${prefix}_score`, `${prefix}-score`, "score"]);
+  };
+
+  // Score kompakt formatieren (4 Nachkommastellen, deutsche Komma-Schreibweise)
+  const formatScore = (v) => {
+    const s0 = toStr(v).trim();
+    if (s0 === "") return "";
+
+    // Versuch numerisch zu parsen (robust gegenüber "," / \.")
+    let s = s0.replace(/\s/g, "");
+    if (s.includes(",") && s.includes(".")) {
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else if (s.includes(",")) {
+      s = s.replace(",", ".");
+    }
+    if (s.startsWith("+")) s = s.slice(1);
+
+    if (!/^-?\d+(\.\d+)?$/.test(s)) return s0;
+    const n = Number.parseFloat(s);
+    if (!Number.isFinite(n)) return s0;
+
+    return n.toFixed(4).replace(".", ",");
+  };
+
+  const getRankLabel = (rankKey) => {
+    const obj = currentRow ? currentRow[rankKey] : null;
+    const raw = getRankScoreRaw(obj, rankKey);
+    const sc = isBlank(raw) ? "" : formatScore(raw);
+    return sc ? `${rankKey}-${sc}` : rankKey;
+  };
   // ---------- Details-Renderer ----------
   const renderDetailsTable = (rows) => {
     return (
@@ -684,7 +722,7 @@ function App() {
   }
 
   // ✅ JobId sicherstellen (minimal: prompt)
-  let jid = (jobId || "").trim();
+  let jid = (project?.jobId || jobId || "").trim();
   if (!jid) {
     jid = (window.prompt("Bitte Job-ID eingeben (z.B. 3974):") || "").trim();
     if (!jid) {
@@ -963,7 +1001,7 @@ function App() {
                 }
                 onClick={() => setActiveRankTab(rk)}
               >
-                {rk}
+                {getRankLabel(rk)}
               </button>
             ))}
           </div>
@@ -981,7 +1019,7 @@ function App() {
                   }
                 >
                   <div className="card-header">
-                    <span>{rk}</span>
+                    <span>{getRankLabel(rk)}</span>
                     <label className="select-label">
                       <input
                         type="radio"
