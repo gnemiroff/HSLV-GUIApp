@@ -1,9 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import "./styles.css";
-import KiPreisCard from "./KiPreisCard";
 
 const RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
-const AI_TAB_KEY = "KI-Preis";
 
 // Drei separate Webhooks
 const WEBHOOK_WISSENSBASIS = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
@@ -1006,15 +1004,6 @@ function App() {
                 {getRankLabel(rk)}
               </button>
             ))}
-
-            <button
-              key={AI_TAB_KEY}
-              className={"tab-btn ai-tab-btn " + (activeRankTab === AI_TAB_KEY ? "active" : "")}
-              onClick={() => setActiveRankTab(AI_TAB_KEY)}
-              title="Prompt für KI-Preis generieren"
-            >
-              {AI_TAB_KEY}
-            </button>
           </div>
 
           <div className="card-container">
@@ -1047,13 +1036,6 @@ function App() {
                 </div>
               );
             })}
-
-            <KiPreisCard
-              visible={activeRankTab === AI_TAB_KEY}
-              currentRow={currentRow}
-              rankKeys={RANK_KEYS}
-              title={AI_TAB_KEY}
-            />
           </div>
         </section>
       </main>
