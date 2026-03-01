@@ -1,17 +1,39 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * KI-Preis Karte:
- * - Baut aus currentRow (Query + Rank1..3) einen Prompt
- * - Zeigt den Prompt in einem großen Feld
- * - "Kopy" Button kopiert den Prompt in die Zwischenablage
- *
- * Erwartete Struktur (wie in App.js):
- * currentRow = { Query: {...}, Rank1: {...}, Rank2: {...}, Rank3: {...} }
+ * - Prompt wird aus Query + Rank1..3 generiert
+ * - "Kopieren" kopiert Prompt
+ * - "Ausführen" sendet Prompt (genau so wie angezeigt) an OpenAI Responses API
+ * - Antwort (JSON) füllt 3 Felder
  */
 
+// -------------------- Konfiguration --------------------
+// 1) API Key (nur DEV / lokal; für PROD bitte Proxy nutzen!)
+const GPT_KEY = (process.env.REACT_APP_OPENAI_API_KEY || "").trim(); // <-- hier später Key setzen oder .env
+// 2) Model
+const GPT_MODEL = (process.env.REACT_APP_OPENAI_MODEL || "gpt-5-mini").trim();
+// 3) Optionaler Proxy (empfohlen!): wenn gesetzt, wird statt OpenAI direkt dieser Endpoint aufgerufen
+const GPT_PROXY_URL = (process.env.REACT_APP_OPENAI_PROXY_URL || "").trim();
+
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+
+// Rank Keys (Default)
 const DEFAULT_RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
 
+// Schema für Structured Outputs (stabil parsebar)
+const KI_PREIS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    preis_comp: { type: "number" },
+    preis_ai: { type: "number" },
+    begruendung: { type: "string" },
+  },
+  required: ["preis_comp", "preis_ai", "begruendung"],
+};
+
+// -------------------- Helpers --------------------
 const toStr = (v) => (v === null || v === undefined ? "" : String(v));
 const isBlank = (v) => toStr(v).trim() === "";
 
@@ -35,60 +57,48 @@ const splitSemi = (v) => {
 
 const firstSemiValue = (v) => {
   const a = splitSemi(v);
-  if (a.length) return a[0];
-  return toStr(v).trim();
+  return a.length ? a[0] : toStr(v).trim();
+};
+
+// Text stark komprimieren (Tokens sparen)
+const compactText = (v, maxLen = 240) => {
+  const s = toStr(v).replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  if (s.length <= maxLen) return s;
+  return s.slice(0, Math.max(0, maxLen - 1)) + "…";
+};
+
+// "12,34" / "1.234,56" / "1234.56" -> number|null
+const parseNumberLoose = (v) => {
+  const s0 = toStr(v).trim();
+  if (!s0 || s0 === "---") return null;
+
+  let s = s0.replace(/\s/g, "");
+  if (s.includes(",") && s.includes(".")) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else if (s.includes(",")) {
+    s = s.replace(",", ".");
+  }
+  if (s.startsWith("+")) s = s.slice(1);
+
+  const n = Number.parseFloat(s);
+  return Number.isFinite(n) ? n : null;
 };
 
 const formatNumber2 = (v) => {
-  const s0 = toStr(v).trim();
-  if (s0 === "") return "";
-  if (s0 === "---") return "---";
-
-  let s = s0.replace(/\s/g, "");
-  if (s.includes(",") && s.includes(".")) {
-    // 1.234,56 -> 1234.56
-    s = s.replace(/\./g, "").replace(",", ".");
-  } else if (s.includes(",")) {
-    s = s.replace(",", ".");
-  }
-  if (s.startsWith("+")) s = s.slice(1);
-
-  if (!/^-?\d+(\.\d+)?$/.test(s)) return s0;
-  const n = Number.parseFloat(s);
-  if (!Number.isFinite(n)) return s0;
-
+  const n = typeof v === "number" ? v : parseNumberLoose(v);
+  if (n === null) return "";
   return n.toFixed(2).replace(".", ",");
-};
-
-const formatScore4 = (v) => {
-  const s0 = toStr(v).trim();
-  if (s0 === "") return "";
-
-  let s = s0.replace(/\s/g, "");
-  if (s.includes(",") && s.includes(".")) {
-    s = s.replace(/\./g, "").replace(",", ".");
-  } else if (s.includes(",")) {
-    s = s.replace(",", ".");
-  }
-  if (s.startsWith("+")) s = s.slice(1);
-
-  if (!/^-?\d+(\.\d+)?$/.test(s)) return s0;
-  const n = Number.parseFloat(s);
-  if (!Number.isFinite(n)) return s0;
-
-  return n.toFixed(4).replace(".", ",");
 };
 
 const getQueryDetails = (queryObj) => {
   const q = queryObj || {};
   return {
-    path: pickFirst(q, ["query_path", "query-path", "path", "queryPath"]),
     oz: pickFirst(q, ["query-oz", "query_oz", "oz", "queryOz"]),
     kurztext: pickFirst(q, ["query-kurztext", "query_kurztext", "kurztext", "queryKurztext"]),
     langtext: pickFirst(q, ["query_text", "query-text", "text", "queryText"]),
     einheit: pickFirst(q, ["query-einheit", "query_einheit", "einheit", "queryEinheit"]),
     menge: pickFirst(q, ["query-menge", "query_menge", "menge", "queryMenge"]),
-    preis: pickFirst(q, ["query-preis", "query_preis", "preis", "unit_price", "unitPrice"]),
   };
 };
 
@@ -96,8 +106,6 @@ const getRankDetails = (rankObj, rankKey) => {
   const r = rankObj || {};
   const prefix = (rankKey || "").toLowerCase();
   return {
-    quellen: pickFirst(r, [`${prefix}-quellen`, `${prefix}_quellen`, "quellen", "sources", "source"]),
-    path: pickFirst(r, [`${prefix}_path`, `${prefix}-path`, "path"]),
     oz: pickFirst(r, [`${prefix}-oz`, `${prefix}_oz`, "oz"]),
     kurztext: pickFirst(r, [`${prefix}-kurztext`, `${prefix}_kurztext`, "kurztext"]),
     langtext: pickFirst(r, [`${prefix}_text`, `${prefix}-text`, "text"]),
@@ -108,100 +116,198 @@ const getRankDetails = (rankObj, rankKey) => {
   };
 };
 
-const fmtLine = (label, value) => {
-  const v = toStr(value).trim();
-  return v ? `- ${label}: ${v}` : "";
+// Response ggf. “unwrap”, falls Proxy die OpenAI Antwort verschachtelt
+const unwrapResponse = (x) => {
+  if (!x) return x;
+  // häufige Wrapper-Patterns:
+  if (x.response && (x.response.output || x.response.output_text || x.response.choices)) return x.response;
+  if (x.data && (x.data.output || x.data.output_text || x.data.choices)) return x.data;
+  if (x.openai && (x.openai.output || x.openai.output_text || x.openai.choices)) return x.openai;
+  return x;
 };
 
-const joinNonEmpty = (lines) => lines.filter((x) => toStr(x).trim() !== "").join("\n");
+// OpenAI Responses API: Text extrahieren (robust)
+const extractAssistantText = (resp0) => {
+  const resp = unwrapResponse(resp0);
+  if (!resp) return "";
 
-function KiPreisCard({
-  visible,
-  currentRow,
-  rankKeys = DEFAULT_RANK_KEYS,
-  title = "KI-Preis",
-}) {
+  // 1) manche SDKs/Proxies geben output_text direkt
+  if (typeof resp.output_text === "string" && resp.output_text.trim()) {
+    return resp.output_text.trim();
+  }
+
+  // 2) Responses API: output -> message -> content -> output_text.text
+  if (Array.isArray(resp.output)) {
+    const chunks = [];
+    for (const item of resp.output) {
+      if (!item) continue;
+
+      // content kann direkt am item hängen (je nach Format)
+      const contentArr = Array.isArray(item.content) ? item.content : [];
+
+      // üblich: type === "message"
+      if (item.type === "message" && contentArr.length) {
+        for (const c of contentArr) {
+          if (!c) continue;
+          if (c.type === "output_text" && typeof c.text === "string") chunks.push(c.text);
+          if (c.type === "text" && typeof c.text === "string") chunks.push(c.text);
+          if (c.type === "refusal" && typeof c.refusal === "string") chunks.push(c.refusal);
+        }
+        continue;
+      }
+
+      // fallback: wenn content direkt so aussieht wie output_text
+      if (contentArr.length) {
+        for (const c of contentArr) {
+          if (!c) continue;
+          if (typeof c.text === "string") chunks.push(c.text);
+          if (typeof c.refusal === "string") chunks.push(c.refusal);
+        }
+      }
+    }
+    const joined = chunks.join("\n").trim();
+    if (joined) return joined;
+  }
+
+  // 3) Chat Completions fallback (falls jemand doch /chat/completions nutzt)
+  const cc = resp?.choices?.[0]?.message?.content;
+  if (typeof cc === "string" && cc.trim()) return cc.trim();
+
+  return "";
+};
+
+const ensureCompleted = (resp0) => {
+  const resp = unwrapResponse(resp0);
+  if (!resp) throw new Error("Keine Response erhalten.");
+
+  if (resp.error) {
+    const msg = resp.error?.message || JSON.stringify(resp.error);
+    throw new Error(msg);
+  }
+
+  if (resp.status && resp.status !== "completed") {
+    const details = resp.incomplete_details ? ` Details: ${JSON.stringify(resp.incomplete_details)}` : "";
+    throw new Error(`OpenAI Response nicht abgeschlossen (status=${resp.status}).${details}`);
+  }
+};
+
+// POST JSON helper
+const postJson = async (url, body, headers = {}) => {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await res.text();
+  let json = null;
+  try {
+    json = raw ? JSON.parse(raw) : null;
+  } catch {
+    json = null;
+  }
+
+  if (!res.ok) {
+    const msg = (json && json.error && (json.error.message || json.error)) || raw || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  if (!json) {
+    throw new Error("Antwort ist kein JSON. RAW: " + raw.slice(0, 400));
+  }
+  return json;
+};
+
+// JSON sicher aus output_text parsen
+const tryParseJson = (text) => {
+  const t = (text || "").trim();
+  if (!t) throw new Error("Leere Antwort von ChatGPT (kein output_text gefunden).");
+  try {
+    return JSON.parse(t);
+  } catch {
+    // fallback: erstes {...} extrahieren
+    const m = t.match(/\{[\s\S]*\}/);
+    if (m) return JSON.parse(m[0]);
+    throw new Error("Antwort ist kein gültiges JSON.");
+  }
+};
+
+// -------------------- Komponente --------------------
+function KiPreisCard({ visible, currentRow, rankKeys = DEFAULT_RANK_KEYS, title = "KI-Preis" }) {
   const taRef = useRef(null);
-  const [copyMsg, setCopyMsg] = useState("");
 
-  const prompt = useMemo(() => {
-    if (!currentRow) return "Keine Daten geladen.";
+  const [copyMsg, setCopyMsg] = useState("");
+  const [runBusy, setRunBusy] = useState(false);
+  const [runMsg, setRunMsg] = useState("");
+
+  const [preisVergleich, setPreisVergleich] = useState("");
+  const [preisVergleichPlusKI, setPreisVergleichPlusKI] = useState("");
+  const [begruendung, setBegruendung] = useState("");
+
+  // optionaler Debug-Block (hilft bei “leer”)
+  const [lastRawResponse, setLastRawResponse] = useState(null);
+  const [lastExtractedText, setLastExtractedText] = useState("");
+
+  const { prompt, unitForDisplay } = useMemo(() => {
+    if (!currentRow) return { prompt: "Keine Daten geladen.", unitForDisplay: "" };
 
     const q = getQueryDetails(currentRow.Query || {});
-    const qMenge = formatNumber2(firstSemiValue(q.menge));
-    const qPreis = formatNumber2(firstSemiValue(q.preis));
+    const qEinheit = toStr(q.einheit).trim();
+    const unitHint = qEinheit ? `EUR/${qEinheit}` : "EUR";
 
-    const queryBlock = joinNonEmpty([
-      fmtLine("Pfad", q.path),
-      fmtLine("OZ", q.oz),
-      fmtLine("Kurztext", q.kurztext),
-      fmtLine("Langtext", q.langtext),
-      fmtLine("Einheit", q.einheit),
-      fmtLine("Menge", qMenge),
-      // Preis ist optional – falls schon befüllt, kann er als Info rein
-      qPreis && qPreis !== "---" ? `- (aktueller) Einheitspreis: ${qPreis} EUR` : "",
-    ]);
+    // Eingabeobjekt bewusst klein halten (Tokens sparen)
+    const inputObj = {
+      unit: qEinheit || null,
+      query: {
+        oz: toStr(q.oz).trim() || null,
+        k: compactText(q.kurztext, 140) || null,
+        t: compactText(q.langtext, 260) || null,
+        m: parseNumberLoose(firstSemiValue(q.menge)),
+      },
+      comps: (rankKeys || []).map((rk) => {
+        const d = getRankDetails(currentRow[rk] || {}, rk);
+        return {
+          r: rk,
+          s: parseNumberLoose(firstSemiValue(d.score)), // score
+          p: parseNumberLoose(firstSemiValue(d.preis)), // preis
+          u: toStr(d.einheit).trim() || null,
+          oz: toStr(d.oz).trim() || null,
+          k: compactText(d.kurztext, 140) || null,
+          t: compactText(d.langtext, 200) || null,
+          m: parseNumberLoose(firstSemiValue(d.menge)),
+        };
+      }),
+    };
 
-    const rankBlocks = (rankKeys || []).map((rk, i) => {
-      const d = getRankDetails(currentRow[rk] || {}, rk);
-
-      const preis1 = formatNumber2(firstSemiValue(d.preis)) || "---";
-      const menge1 = formatNumber2(firstSemiValue(d.menge));
-      const scoreTxt = formatScore4(d.score);
-
-      const leistungKurz = toStr(d.kurztext).trim() || "(kein Kurztext)";
-      const leistungLang = toStr(d.langtext).trim();
-
-      const header = `${i + 1}) ${rk}${scoreTxt ? ` (Score: ${scoreTxt})` : ""}`;
-      const body = joinNonEmpty([
-        fmtLine("Pfad", d.path),
-        fmtLine("OZ", d.oz),
-        `- Kurztext: ${leistungKurz}`,
-        leistungLang ? `- Langtext: ${leistungLang}` : "",
-        fmtLine("Einheit", d.einheit),
-        menge1 ? `- Menge: ${menge1}` : "",
-        `- Einheitspreis: ${preis1} EUR${d.einheit ? `/${toStr(d.einheit).trim()}` : ""}`,
-        d.quellen ? `- Quellen: ${splitSemi(d.quellen).slice(0, 6).join("; ")}` : "",
-      ]);
-
-      return `${header}\n${body}`;
-    });
-
-    const ranksBlock = rankBlocks.length ? rankBlocks.join("\n\n") : "(keine Ranks vorhanden)";
-
-    const unitHint = q.einheit ? `EUR/${toStr(q.einheit).trim()}` : "EUR pro Einheit";
-
-    return [
-      "Du bist ein erfahrener Bauingenieur und Kalkulator.",
-      `Ich möchte einen plausiblen Einheitspreis (${unitHint}) für eine neue Leistung ermitteln.`,
-      "",
-      "### Zu bepreisende Leistung",
-      queryBlock || "(keine Details zur Query vorhanden)",
-      "",
-      "### Vergleichbare Leistungen aus der Vergangenheit (inkl. meiner damaligen Einheitspreise)",
-      ranksBlock,
-      "",
-      "Bitte gib mir:",
-      `1) Einen empfohlenen Einheitspreis als Zahl (${unitHint}).`,
-      "2) Eine kurze Begründung (max. 5 Sätze).",
-      "3) Falls sinnvoll: eine Preisspanne (min/max) und welche Faktoren die Spanne treiben.",
-      "4) Nenne deine Annahmen, falls Informationen fehlen oder unklar sind.",
-	  "5) Versuche die Frage zunächst allein aufgrund der oben gegebenen Daten zu beantworten, ohne dein eigenes Wissen bei der Antwortgenerierung heranzuziehen.", 
-	  "6) Versuche den Preis mithilfe deines eigen Wissens zu beantworten.",
-	  "7) Vergleiche die zwei Ergebisse (mit und Ohne deines Wissen).",
+    // TOKEN-OPTIMIERT: kurze Regeln + minified JSON
+    // (Prompt = genau das, was später gesendet wird.)
+    const p = [
+      `Baukalkulator. Ziel: Einheitspreis für QUERY (${unitHint}).`,
+      "Antworte als JSON mit: preis_comp (nur comps+scores), preis_ai (preis_comp + Fachwissen), begruendung (<=5 Sätze).",
+      "Regel preis_comp: nutze nur comps mit p!=null. Wenn Scores (s) vorhanden und Σs>0: Σ(p*s)/Σs, sonst Mittelwert(p).",
+      "INPUT=" + JSON.stringify(inputObj),
     ].join("\n");
+
+    return { prompt: p, unitForDisplay: unitHint };
   }, [currentRow, rankKeys]);
 
+  // Reset bei neuem Prompt
+  useEffect(() => {
+    setRunMsg("");
+    setPreisVergleich("");
+    setPreisVergleichPlusKI("");
+    setBegruendung("");
+    setLastRawResponse(null);
+    setLastExtractedText("");
+  }, [prompt]);
+
   const doLegacyCopy = () => {
-    // Fallback für Browser, die navigator.clipboard blocken
     const ta = taRef.current;
     if (!ta) return false;
     ta.focus();
     ta.select();
     try {
-      const ok = document.execCommand("copy");
-      return !!ok;
-    } catch (e) {
+      return !!document.execCommand("copy");
+    } catch {
       return false;
     }
   };
@@ -217,48 +323,202 @@ function KiPreisCard({
         setCopyMsg("✅ Prompt kopiert.");
         return;
       }
-    } catch (e) {
-      // ignore -> fallback
+    } catch {
+      // fallback
     }
 
-    const ok = doLegacyCopy();
-    setCopyMsg(ok ? "✅ Prompt kopiert." : "❌ Kopieren fehlgeschlagen (Browserrechte).");
+    setCopyMsg(doLegacyCopy() ? "✅ Prompt kopiert." : "❌ Kopieren fehlgeschlagen (Browserrechte).");
   };
+
+  const callOpenAI = async () => {
+    // Wichtig: KEIN temperature (gpt-5-mini kann das ablehnen)
+    const body = {
+      model: GPT_MODEL,
+      input: prompt, // exakt Prompt aus Textfeld
+      reasoning: { effort: "low" }, // weniger Tokens/Latency
+      max_output_tokens: 2050,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "ki_preis_result",
+          strict: true,
+          schema: KI_PREIS_SCHEMA,
+        },
+      },
+      store: false,
+    };
+
+    if (GPT_PROXY_URL) {
+      return await postJson(GPT_PROXY_URL, body);
+    }
+
+    if (!GPT_KEY) {
+      throw new Error(
+        "Kein GPT_KEY gesetzt. Setze REACT_APP_OPENAI_API_KEY oder nutze REACT_APP_OPENAI_PROXY_URL (empfohlen)."
+      );
+    }
+
+    return await postJson(OPENAI_RESPONSES_URL, body, {
+      Authorization: `Bearer ${GPT_KEY}`,
+    });
+  };
+
+  const onRun = async () => {
+    setRunMsg("");
+    if (!prompt || prompt === "Keine Daten geladen.") return;
+
+    setRunBusy(true);
+    try {
+      const resp = await callOpenAI();
+
+      // Debug speichern (hilft sofort bei Problemen)
+      setLastRawResponse(resp);
+
+      ensureCompleted(resp);
+
+      const outText = extractAssistantText(resp);
+      setLastExtractedText(outText || "");
+
+      const obj = tryParseJson(outText);
+
+      const unitLabel = unitForDisplay ? ` ${unitForDisplay}` : "";
+
+      setPreisVergleich(
+        typeof obj.preis_comp === "number"
+          ? `${formatNumber2(obj.preis_comp)}${unitLabel}`
+          : toStr(obj.preis_comp).trim()
+      );
+
+      setPreisVergleichPlusKI(
+        typeof obj.preis_ai === "number"
+          ? `${formatNumber2(obj.preis_ai)}${unitLabel}`
+          : toStr(obj.preis_ai).trim()
+      );
+
+      setBegruendung(toStr(obj.begruendung).trim());
+      setRunMsg("✅ Antwort erhalten.");
+    } catch (e) {
+      setRunMsg(`❌ ${e?.message || String(e)}`);
+    } finally {
+      setRunBusy(false);
+    }
+  };
+
+  const canRun = !!prompt && prompt !== "Keine Daten geladen." && !runBusy;
 
   return (
     <div
       className={"rank-card ai-card " + (visible ? "visible" : "hidden")}
-      style={{
-        borderStyle: "dashed",
-        borderWidth: 2,
-      }}
+      style={{ borderStyle: "dashed", borderWidth: 2 }}
     >
       <div className="card-header" style={{ alignItems: "flex-start" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
           <span>{title}</span>
-          <small style={{ opacity: 0.75 }}>
-            Prompt wird aus Query + Rank1..3 automatisch generiert
-          </small>
+          <small style={{ opacity: 0.75 }}>Prompt aus Query + Rank1..3 (token-sparend)</small>
         </div>
-
-        {/* rechts im Header frei lassen (kein Radio-Select) */}
       </div>
 
       <div className="card-body">
         <textarea
           ref={taRef}
           className="langtext-area"
-          style={{ width: "100%", minHeight: 260, resize: "vertical" }}
+          style={{ width: "100%", minHeight: 220, resize: "vertical" }}
           readOnly
           value={prompt}
         />
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            marginTop: 10,
+            flexWrap: "wrap",
+          }}
+        >
           <button type="button" onClick={onCopy} disabled={!prompt || prompt === "Keine Daten geladen."}>
             Kopieren
           </button>
+
+          <button type="button" onClick={onRun} disabled={!canRun}>
+            {runBusy ? "..." : "Ausführen"}
+          </button>
+
           <span style={{ fontSize: 13, opacity: 0.85 }}>{copyMsg}</span>
+          <span style={{ fontSize: 13, opacity: 0.85 }}>{runMsg}</span>
         </div>
+
+        {/* 3 Ergebnisfelder */}
+        <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 4 }}>
+              1) Preis nur aufgrund der Vergleichbaren Leistungen
+            </div>
+            <input
+              type="text"
+              readOnly
+              value={preisVergleich}
+              style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
+              placeholder="(noch leer)"
+            />
+          </div>
+
+          <div>
+            <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 4 }}>
+              2) Preis aufgrund Vergleichbarer Leistungen + KI-Wissen
+            </div>
+            <input
+              type="text"
+              readOnly
+              value={preisVergleichPlusKI}
+              style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
+              placeholder="(noch leer)"
+            />
+          </div>
+
+          <div>
+            <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 4 }}>
+              3) Begründung des Unterschiedes
+            </div>
+            <textarea
+              readOnly
+              value={begruendung}
+              style={{
+                width: "100%",
+                minHeight: 100,
+                padding: 8,
+                boxSizing: "border-box",
+                resize: "vertical",
+              }}
+              placeholder="(noch leer)"
+            />
+          </div>
+        </div>
+
+        {/* Hinweis falls kein Key/Proxy */}
+        {!GPT_PROXY_URL && !GPT_KEY ? (
+          <div style={{ marginTop: 10, fontSize: 12, opacity: 0.85 }}>
+            Hinweis: Kein API-Key gesetzt. Setze <code>REACT_APP_OPENAI_API_KEY</code> oder nutze{" "}
+            <code>REACT_APP_OPENAI_PROXY_URL</code> (empfohlen).
+          </div>
+        ) : null}
+
+        {/* Debug (optional, aber extrem hilfreich bei “Leere Antwort…”) */}
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ cursor: "pointer", opacity: 0.85 }}>Debug</summary>
+          <div style={{ marginTop: 8, fontSize: 12 }}>
+            <div style={{ marginBottom: 6 }}>
+              <b>Extracted output_text:</b>
+              <pre style={{ whiteSpace: "pre-wrap" }}>{lastExtractedText || "(leer)"}</pre>
+            </div>
+            <div>
+              <b>Raw Response JSON:</b>
+              <pre style={{ whiteSpace: "pre-wrap" }}>
+                {lastRawResponse ? JSON.stringify(lastRawResponse, null, 2) : "(noch keine Antwort)"}
+              </pre>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   );
