@@ -6,22 +6,30 @@ const RANK_KEYS = ["Rank1", "Rank2", "Rank3"];
 const AI_TAB_KEY = "KI-Preis";
 
 // Drei separate Webhooks
-const WEBHOOK_WISSENSBASIS = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
-const WEBHOOK_LV = "http://localhost:5678/webhook/60b65bb0-3f9d-4f1c-8f4f-aa982e5ea5b7";
-const WEBHOOK_X84 = "http://localhost:5678/webhook/f12d2ee2-9885-4204-91e0-4b6d3fa0c2bf";
+// const WEBHOOK_WISSENSBASIS = "http://localhost:5678/webhook/3c03d899-1d40-4788-b4f1-f7fc9d281879";
+// const WEBHOOK_LV = "http://localhost:5678/webhook/60b65bb0-3f9d-4f1c-8f4f-aa982e5ea5b7";
+// const WEBHOOK_X84 = "http://localhost:5678/webhook/f12d2ee2-9885-4204-91e0-4b6d3fa0c2bf";
+// const WEBHOOK_START_PROJECT = "http://localhost:5678/webhook/8b918e0c-f8b2-43e1-a142-e21751cc08f4";
 
-const WEBHOOK_START_PROJECT = "http://localhost:5678/webhook/8b918e0c-f8b2-43e1-a142-e21751cc08f4";
 
-// Polling: passe diese beiden Webhook-IDs an deine Status/Result-Workflows an
-const WEBHOOK_STATUS_BASE = "http://localhost:5678/webhook/6a1d9532-6f66-48d4-8722-edaabbfd3115/job/status";
-const WEBHOOK_RESULT_BASE = "http://localhost:5678/webhook/ffb126b7-6265-4461-aca4-02a9d06febeb/job/result";
 
-// Helper: baut URL inkl. jobId
-const buildStatusUrl = (jobId) => `${WEBHOOK_STATUS_BASE}/${jobId}`;
-const buildResultUrl = (jobId) => `${WEBHOOK_RESULT_BASE}/${jobId}`;
+// -------------------- Konfiguration --------------------
+// Webhook der die URL anderer Webhooks zurück liefert
+const WEBHOOK_START_PROJECT = (process.env.REACT_APP_WEBHOOK_START_PROJECT || "").trim();
+// x84Url: wird aus .env gelesen (Backend liefert sie nicht via StartProject)
+const WEBHOOK_X84 = (process.env.REACT_APP_WEBHOOK_X84 || "").trim();
 
-// Upload (z.B. priced JSON -> X84). Erwarteter Pfad: /job/x84/:jobId (Workflow musst du entsprechend anlegen)
-const buildX84Url = (jobId) => `${WEBHOOK_X84}/job/x84/${jobId}`;
+
+// statusUrl + resultUrl kommen vom Backend (Antwort des startUrl-Calls)
+// kbUrl + lvUrl + startUrl kommen vom Backend (Antwort des startProject-Calls)
+
+
+
+
+
+
+
+
 
 
 function App() {
@@ -531,16 +539,27 @@ function App() {
       const lvUrl = String(initObj?.lvUrl ?? "").trim();
       const startUrl = String(initObj?.startUrl ?? "").trim();
 
-      if (!jobId || !kbUrl || !lvUrl || !startUrl) {
-        throw new Error(`StartProject liefert keine gültigen URLs. Antwort: ${JSON.stringify(initObj)}`);
+      // statusUrl + resultUrl kommen erst vom startUrl-Call (in startAnalyse)
+      // x84Url kommt aus der .env
+      const x84Url = WEBHOOK_X84;
+
+      const missing = [];
+      if (!jobId)    missing.push("jobId");
+      if (!kbUrl)    missing.push("kbUrl");
+      if (!lvUrl)    missing.push("lvUrl");
+      if (!startUrl) missing.push("startUrl");
+      if (!x84Url)   missing.push("x84Url (REACT_APP_WEBHOOK_X84 in .env fehlt)");
+
+      if (missing.length > 0) {
+        throw new Error(
+          `StartProject liefert folgende Felder nicht: ${missing.join(", ")}.\n` +
+          `Antwort war: ${JSON.stringify(initObj)}`
+        );
       }
 
-      // 1) Polling URLs (entweder vom Server oder lokal aus jobId bauen)
-      const statusUrl = String(initObj?.statusUrl ?? buildStatusUrl(jobId));
-      const resultUrl = String(initObj?.resultUrl ?? buildResultUrl(jobId));
-
-      // 2) Upload-URL für priced-json/X84 (Workflow musst du entsprechend bauen)
-      const x84Url = String(initObj?.x84Url ?? initObj?.pricedJsonUrl ?? buildX84Url(jobId));
+      // statusUrl/resultUrl: werden nach startUrl-Call in startAnalyse gesetzt
+      const statusUrl = "";
+      const resultUrl = "";
 
       setProject({ jobId, kbUrl, lvUrl, startUrl, statusUrl, resultUrl, x84Url });
 
@@ -604,15 +623,12 @@ function App() {
     }
 
     const startUrl = project?.startUrl;
-    const statusUrl = project?.statusUrl || buildStatusUrl(jobId);
-    const resultUrl = project?.resultUrl || buildResultUrl(jobId);
-
     if (!startUrl) {
-      setStatus('Start-URL fehlt. Bitte Projekt erneut hochladen.');
+      setStatus('Analyse nicht möglich – startUrl fehlt. Bitte Projekt erneut hochladen.');
       return;
     }
 
-    // 1) Analyse starten (muss dieselbe jobId verwenden wie Upload!)
+    // 1) Analyse starten – statusUrl/resultUrl kommen als Antwort zurück
     setAnalysisRunning(true);
     setAnalysisProgress(0);
     setAnalysisText('Analyse wird gestartet...');
@@ -626,23 +642,32 @@ function App() {
         throw new Error(`Start fehlgeschlagen: ${raw || `HTTP ${resStart.status}`}`);
       }
 
-      // Optional: Start-Workflow kann statusUrl/resultUrl zurückgeben -> übernehmen
-      try {
-        const maybe = await resStart.json();
-        const obj = unwrapN8nData(maybe);
-        if (obj && (obj.statusUrl || obj.resultUrl || obj.x84Url || obj.pricedJsonUrl)) {
-          setProject((prev) => ({
-            ...(prev || {}),
-            statusUrl: obj.statusUrl || prev?.statusUrl || statusUrl,
-            resultUrl: obj.resultUrl || prev?.resultUrl || resultUrl,
-            x84Url: obj.x84Url || obj.pricedJsonUrl || prev?.x84Url,
-          }));
-        }
-      } catch (_) {
-        // ok: Start-Response ist evtl. leer oder kein JSON
+      // statusUrl + resultUrl kommen vom startUrl-Call zurück
+      const startJson = await resStart.json();
+      const startObj = unwrapN8nData(startJson);
+
+      const statusUrl = String(startObj?.statusUrl ?? "").trim();
+      const resultUrl = String(startObj?.resultUrl ?? "").trim();
+
+      if (!statusUrl || !resultUrl) {
+        throw new Error(
+          `startUrl-Antwort liefert keine statusUrl/resultUrl.\nAntwort: ${JSON.stringify(startObj)}`
+        );
       }
 
-      // 2) Polling (Status) – URL muss jobId enthalten
+      // x84Url optional aktualisieren falls mitgeliefert
+      if (startObj?.x84Url || startObj?.pricedJsonUrl) {
+        setProject((prev) => ({
+          ...(prev || {}),
+          statusUrl,
+          resultUrl,
+          x84Url: startObj.x84Url || startObj.pricedJsonUrl || prev?.x84Url,
+        }));
+      } else {
+        setProject((prev) => ({ ...(prev || {}), statusUrl, resultUrl }));
+      }
+
+      // 2) Polling (Status)
       let consecutiveErrors = 0;
       while (!pollAbortRef.current.aborted) {
         const resStatus = await fetch(statusUrl, { method: 'GET' });
@@ -734,8 +759,13 @@ function App() {
     setJobId(jid);
   }
 
-  // ✅ WICHTIG: richtiger Endpoint inkl. Pfad + jobId
-  const x84Url = `${WEBHOOK_X84}/job/x84/${encodeURIComponent(jid)}`;
+  // x84Url aus project-State (gesetzt in uploadProjekt aus REACT_APP_WEBHOOK_X84)
+  const x84Base = project?.x84Url;
+  if (!x84Base) {
+    setStatus("x84Url fehlt – bitte zuerst ein Projekt hochladen oder REACT_APP_WEBHOOK_X84 in .env setzen.");
+    return;
+  }
+  const x84Url = `${x84Base}/job/x84/${encodeURIComponent(jid)}`;
 
   try {
     const output = data.map((row, idx) => ({
@@ -876,9 +906,9 @@ function App() {
               </div>
 
               <div className="upload-hint">
-                Wissensbasis → <span className="mono">{WEBHOOK_WISSENSBASIS}</span>
+                Wissensbasis → <span className="mono">{project?.kbUrl || "—"}</span>
                 <br />
-                LV zu bepreisen → <span className="mono">{WEBHOOK_LV}</span>
+                LV zu bepreisen → <span className="mono">{project?.lvUrl || "—"}</span>
               </div>
 
               {uploadMessage ? (
